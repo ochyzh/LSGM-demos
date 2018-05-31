@@ -1,0 +1,224 @@
+Author: Olga
+Date: May 22, 2018
+Goal: Estimate an LSGM
+
+We need to simulate some spatial data, so let's set a seed for repricability:
+```{r}
+rm(list=ls())
+set.seed(400)
+```
+
+
+Set the number of nodes:
+```{r}
+n=100
+```
+
+
+Draw a node-level covariate, x1:
+```{r}
+x1 <- rnorm(n,0,1)
+```
+
+Set the true value for the estimation parameters, b0, b1, and eta. Combine these into a vector, fixedpars, (it'd be easier to feed them into a function later).
+```{r}
+b0 <- -.5
+b1 <- .5
+eta<- .05
+fixedpars<-c(b0,b1,eta)
+```
+
+To generate a meaningful symmetric matrix, w, assign two unique coordinates, xcoord and ycoord, to each node. A set of two coordinates can uniquely identify 100 nodes with 10 values on each coordinate (a 10 by 10 grid).  You could draw these randomly from some distribution, but I didn't in this example (I wanted a little bit more control). Then I will use these coordinates to put my nodes on a 10X10 grid and then calculating the euclidean distance, which I will use as the values of connectivity (these values will populate the w matrix). Note that the diagonal of the w will be 0s by construction (also, unit i is assumed to not affect its own outcome), greater values in the cells of the matrix will then indicate greater connectivity.  This is a simulated matrix, so it can work any way I choose to make it.
+
+I find this part to be the trickiest part of simulating spatial data.  You want your matrix to be meaningful, i.e. if node 1 is close to node 2 and node 2 is close to node 3, then nodes 1 and 3 are also not too far away. You also want your matrix to work with the rest of the data (this may or may not be a problem if working with real data, but it's always a concern with simulated data). Matrix with too large of values or too small of values will may lead to a degenerative network (all 1s or all 0s) or unstable and incorrect estimates. I played with this example matrix quite a bit to make it work.  For example, notice that rather than taking the sum of squared distances between coordinates to the power 1/2 (square root), I took it to the power 1/4.  Also notice that I divided all cells of the matrix by the number of nodes times 700. The latter part is re-scaling of the matrix (the numbers in my matrix are simulated and have no intrinsic values, after all). Re-scaling is often necessary with real-life examples as well.  There is nothing wrong with it, a way to think about it is that you can measure a real-worled w matrix as physical distances among nodes, but distances can be measured in miles or meters or kilometers.  In OLS regression, we frequently re-scale our x by multiplying/dividing it by some value or even taking a log of it.  The same applies to the w matrices.
+
+```{r}
+xcoord<-c(0,0,0,0,0,8,9,10,11,12)
+ycoord<-c(1,1,1,2,3,0,0,0,0,0)
+coord<-expand.grid(x1=xcoord, y1=ycoord, x2=xcoord, y2=ycoord)
+dist<-((coord$x1-coord$x2)^2+(coord$y1-coord$y2)^2)^(1/4)
+w<-matrix(dist,nrow=100, ncol=100)
+w<-w/((nrow(w)-1)*1000)
+
+```
+
+
+Draw a vector of random starting values for network edges, yjs:
+```{r}
+yjs <- rbinom(n=n, size=1, prob=.5)
+```
+
+Now we are going to simulate networks assuming an lsgm data-generating process using a Gibbs sampler.  In a Gibbs sampler, each observation is generated one at a time as a function of outcomes in all other observations, the resulting value is used to update the starting values, and this process is repeated until we have a complete network, which constitutes a single simulation. The complete network is then used as the starting values for the next simulation.
+
+This function is the first step of a Gibbs sampler. Ittakes the parameter values, xs, w, and initial values for y's and generates a value for y for a single observation.
+
+```{r}
+spatbin.genone<-function(fixedpars,xs,w,curys){
+b0<-fixedpars[1]
+b1<-fixedpars[2]
+eta<-fixedpars[3]
+x1<-xs
+xbeta<- b0+b1*x1
+kappa<-exp(xbeta)/(1+exp(xbeta))
+A_i=log(kappa/(1-kappa))+eta*w%*%(curys-kappa)
+p_i<- exp(A_i)/(1+exp(A_i))
+y<- rbinom(n=length(curys), size=1, prob=p_i)
+return(y)
+}
+
+```
+
+
+This program uses a Gibbs sampler to generate values of y for every observation in the data.
+
+```{r}
+spatbin.onegibbs<-function(fixedpars,xs,w,curys){
+cnt<-0
+n<-length(curys)
+newys<-NULL
+repeat{
+	cnt<-cnt+1
+	ny<-spatbin.genone(fixedpars=fixedpars,xs=xs,w=w,curys=curys)
+	curys[cnt]<-ny[cnt]
+	if(cnt==n) break
+	}
+newys<-curys
+return(newys)
+}
+
+```
+
+
+
+This program iterates the Gibbs sampler to generate spatial data. You need to provide values for M, which is the total number of simulations (i.e., the number of time the program will estimate a complete network), burnin (the number of simulations to discard before saving the subsequent ones).  Simulations that are saved are usually also thinned. For example for thinning of 10, a researcher would keep every 10th simulated newtork and discard all other networks.  Here, we will save all networks after burnin and then this the saved networks as desired.
+
+```{r}
+spatbin.genfield<-function(fixedpars,xs,w,y0s,M,burnin){
+M<-M+burnin
+curys<-y0s
+cnt<-0
+res<-as.data.frame(y0s)
+repeat{
+	cnt<-cnt+1
+	newys<-spatbin.onegibbs(fixedpars=fixedpars,xs=xs,w=w,curys=curys)
+	curys<-newys
+	if(cnt>burnin)
+	res<-cbind(res,curys)
+	if(cnt==M) break
+	}
+
+return(res)
+}
+```
+
+Now we can run our functions to generate spatial data.  Notice how the last function calls up the previous function, which calls up the first function. I am going to set burnin to 50000 (it takes less than 5 minutes) and then keep 10000 subsequent networks (then I can thin by 100 and will be left with 100 simulated networks to work with). We need one network to get the estimates of the coefficients, and the rest to get estimates of standard errors.
+
+The resulting object, spat_data, will contain the starting values as the first column (obviously I did not need to save them, but I like to), and then each subsequent column is a simulated network.
+
+```{r}
+ptm<-proc.time()
+spat_data<-spatbin.genfield(fixedpars=fixedpars,xs=x1,w=w,y0s=yjs,M=10000,burnin=50000)
+ptm1<-proc.time()
+myt<-(ptm1-ptm)/60
+print(paste(myt[3], " minutes", sep=""))
+```
+
+Now that we simulated spatial data with the desired parameters, we can run an lsgm model on it.  Here is the likelihood, loglik, and its gradient, loglik_gr.  The gradient is not necessary, but optimization is a little faster if you provide it. 
+```{r}
+#Gradient function for loglik_C:
+loglik_gr<-function(par,x,W,Y){
+b0<-par[1]
+b1<-par[2]
+eta<-par[3]
+ones<-rep(1,100)
+xs<-cbind(ones,x1)
+xbeta<-b0+b1*x1
+kappa<-exp(xbeta)/(1+exp(xbeta))
+etas<-w%*%(Y-kappa)
+A_i=log(kappa/(1-kappa))+eta*w%*%(Y-kappa)
+p_i<- exp(A_i)/(1+exp(A_i))
+logl<-Y*log(p_i)+(1-Y)*log(1-p_i)
+	dl_d=(Y/p_i-(1-Y)/(1-p_i))/((1/p_i+1/(1-p_i)))
+	dl_db0=t(dl_d)%*%as.matrix(xs[,1])
+	dl_db1=t(dl_d)%*%as.matrix(x1)
+	dl_deta=t(dl_d)%*%as.matrix(etas)
+	newpars<-cbind(dl_db0, dl_db1,dl_deta)
+return(newpars)
+}
+
+#Likelihood
+loglik<-function(par,x,W,Y){
+b0<-par[1]
+b1<-par[2]
+eta<-par[3]
+xbeta<-b0+b1*x1
+kappa<-exp(xbeta)/(1+exp(xbeta))
+A_i=log(kappa/(1-kappa))+eta*w%*%(Y-kappa)
+p_i<- exp(A_i)/(1+exp(A_i))
+logl<-Y*log(p_i)+(1-Y)*log(1-p_i)
+ell <- -sum(logl)
+#cat("ell",ell, fill=TRUE)
+return(ell)
+}
+
+```
+
+Let's estimate an lsgm on the first one of our simulated networks, spat_data[2] (remember, spat_data[1] contains the starting values) :
+```{r}
+myres<-optimr(par=c(0,0,0),loglik,gr=function(...) loglik_gr(...)*10e-1,x=x1,W=w,Y=as.matrix(spat_data[2]))
+
+```
+
+Loot at our estimates, and compared them to the true values, fixedpars:
+```{r}
+myres$par
+fixedpars
+```
+
+Now to get standard errors, we unfortunately cannot simply invert the hessian here (because we used a pseudo-likelihood, so the hessian of that is meaningless).  So we are going to obtain the standard errors using a simulation, i.e. we will estimate the coefficients on 100 realizations of our network and use the standard deviations of these estimates to approximate the standard errors. If we were working with real-data, we would first estimate the coefficients, then simulate 100 networks using those coefficients, estimate our model on each of the simulated networks, and then take the standard deviations of the estimates to get the standard errors. This is known as a parametric bootstrap approach.
+
+Below is a function that estimates the coefficients on each of the simulated networks:
+```{r}
+sim_est<-function(Y){
+ res<-optimr(par=par,loglik,gr=function(...) loglik_gr(...)*10e-1,x=x,W=W,Y=as.matrix(Y)) 
+ return(c(res$par,res$convergence))
+}
+```
+
+I am going to use lapply to apply this function to each of the simulated networks. But first, I will thin the simulated data to only keep every 100th simulation.
+
+This is thinning:
+```{r}
+sims<-spat_data[seq(2, length(spat_data),by=100)]
+
+```
+
+Now apply sim_est to each of the simulated networks. I am going to turn off printing for this output, to not make this document 100 pages long. I will also use mclapply to take advantage of multiple cores.
+```{r echo=T, results='hide'}
+myres_sim<-mclapply(sims, sim_est)
+myres_sim[1]
+```
+
+Extract the coefficients from the results, 
+```{r}
+myres_all<-matrix(unlist(myres_sim),nrow=4,ncol=100)
+myres_coef<-myres_all[1:3,]
+coefs<-rowMeans(myres_coef)
+spprob_std<-apply(spprob_res[,1:100],1,sd)
+
+true<-c(1,1,.05)
+```
+
+
+We can look at the distributions of the recovered coefficients:
+
+coeff<-colMeans(est_data[-1,])
+se<-apply(est_data[-1,],2,sd)
+table<-rbind(fixedpars,coeff,se)
+table
+
+write.table(table, file = "MC_res/table01.txt", append = FALSE, sep = "&",
+            eol = "\\", na = "NA", dec = ".", row.names = TRUE,
+            col.names = TRUE)
+
+myres_coef
